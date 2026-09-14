@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.aws-sam/
+volume/
+localstack-data/
+.env
+.DS_Store
+template.local.yaml

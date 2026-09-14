@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Instalar dependências
+        run: uv pip install --system -r requirements.txt -r dev-requirements.txt
+      - name: Lint
+        run: ruff check src tests
+      - name: Testes unitários
+        run: pytest -m "not e2e" -v --cov=src --cov-fail-under=80
+      - name: Validar template SAM
+        run: sam validate --region us-east-1
+      - name: Validar ASL
+        run: python -m json.tool statemachine/purchase_saga.asl.json > /dev/null
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Instalar dependências
+        run: uv pip install --system -r requirements.txt -r dev-requirements.txt
+      - name: Subir LocalStack e implantar
+        run: ./scripts/deploy-local.sh
+      - name: Testes E2E
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: |
+          API_URL=$(aws --endpoint-url=http://localhost:4566 --region us-east-1 cloudformation describe-stacks \
+            --stack-name fase5-local \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          API_URL="$API_URL" AWS_ENDPOINT_URL=http://localhost:4566 pytest -m e2e -v

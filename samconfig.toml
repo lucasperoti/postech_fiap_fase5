@@ -1,0 +1,8 @@
+version = 0.1
+[default.local.deploy.parameters]
+stack_name = "fase5-local"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+resolve_s3 = true
+confirm_changeset = false
+disable_rollback = true

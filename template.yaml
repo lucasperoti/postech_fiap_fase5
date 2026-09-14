@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Fase 5 - Plataforma de revenda de veiculos serverless (SAM)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        VEICULOS_TABLE: !Ref VeiculosTable
+        CLIENTES_TABLE: !Ref ClientesTable
+        COMPRAS_TABLE: !Ref ComprasTable
+        KMS_KEY_ID: !Ref ChaveDadosSensiveis
+        WEBHOOK_SECRET_ARN: !Ref SegredoWebhook
+
+Resources:
+  VeiculosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-veiculos"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ClientesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-clientes"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: cognito_sub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: cognito_sub
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ComprasTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-compras"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: cliente_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: cliente_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ChaveDadosSensiveis:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Chave para dados sensiveis de clientes (CPF, endereco)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PermitirAdministracaoPelaConta
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+
+  AliasChaveDados:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-dados-sensiveis"
+      TargetKeyId: !Ref ChaveDadosSensiveis
+
+  SegredoWebhook:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Segredo para validacao do webhook de pagamento
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: segredo
+        PasswordLength: 32
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+        DefaultAuthorizer: CognitoAuth
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-clientes"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: api-clientes
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
+
+  GrupoAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref UserPool
+
+  ClientesFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: clientes.handlers.criar_cliente
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+              Resource: !GetAtt ChaveDadosSensiveis.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+              Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool}"
+      Events:
+        CriarCliente:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /clientes
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ClientesExcluirFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: clientes.handlers.excluir_cliente
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientesTable
+      Events:
+        ExcluirCliente:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /clientes/me
+            Method: DELETE
+
+  VeiculosCriarFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: veiculos.handlers.criar_veiculo
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+      Events:
+        CriarVeiculo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /veiculos
+            Method: POST
+
+  VeiculosEditarFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: veiculos.handlers.editar_veiculo
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+      Events:
+        EditarVeiculo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /veiculos/{id}
+            Method: PUT
+
+  VeiculosListarFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: veiculos.handlers.listar_veiculos
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+      Events:
+        ListarVeiculos:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /veiculos
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  ComprasIniciarFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.handlers.iniciar_compra
+      Environment:
+        Variables:
+          SAGA_ARN: !Ref MaquinaCompra
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientesTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt MaquinaCompra.Name
+      Events:
+        IniciarCompra:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /compras
+            Method: POST
+
+  ComprasRetirarFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.handlers.retirar_veiculo
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ClientesTable
+      Events:
+        RetirarVeiculo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /compras/{id}/retirada
+            Method: POST
+
+  AguardarPagamentoFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.atividades.aguardar_pagamento
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+
+  ConfirmarVendaFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.atividades.confirmar_venda
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+
+  LiberarReservaFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.atividades.liberar_reserva
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+
+  ExpirarReservasFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: compras.expirar.expirar_reservas
+      Environment:
+        Variables:
+          SAGA_ARN: !Ref MaquinaCompra
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VeiculosTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskFailure
+              Resource: !GetAtt MaquinaCompra.Arn
+      Events:
+        ExpiracaoAgendada:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+
+  WebhookPagamentoFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: pagamentos.handlers.processar_webhook
+      Environment:
+        Variables:
+          SAGA_ARN: !Ref MaquinaCompra
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SegredoWebhook
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+                - states:SendTaskFailure
+              Resource: !GetAtt MaquinaCompra.Arn
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComprasTable
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /pagamentos/webhook
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  MaquinaCompra:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-purchase-saga"
+      DefinitionUri: statemachine/purchase_saga.asl.json
+      DefinitionSubstitutions:
+        AguardarPagamentoFnArn: !GetAtt AguardarPagamentoFn.Arn
+        ConfirmarVendaFnArn: !GetAtt ConfirmarVendaFn.Arn
+        LiberarReservaFnArn: !GetAtt LiberarReservaFn.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AguardarPagamentoFn
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ConfirmarVendaFn
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LiberarReservaFn
+      Type: STANDARD
+
+Outputs:
+  ApiUrl:
+    Description: URL da API
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  UserPoolId:
+    Description: Id do User Pool Cognito
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Id do Client do User Pool
+    Value: !Ref UserPoolClient

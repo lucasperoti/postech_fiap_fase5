@@ -1,0 +1,85 @@
+{
+  "Comment": "SAGA de compra: aguarda pagamento, confirma venda ou compensa a reserva",
+  "StartAt": "AguardarPagamento",
+  "States": {
+    "AguardarPagamento": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${AguardarPagamentoFnArn}",
+        "Payload": {
+          "compra_id.$": "$.compra_id",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSeconds": 1800,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout", "States.TaskFailed"],
+          "ResultPath": "$.erro",
+          "Next": "Compensar"
+        }
+      ],
+      "Next": "VerificarResultado"
+    },
+    "VerificarResultado": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.resultado",
+          "StringEquals": "APROVADO",
+          "Next": "ConfirmarVenda"
+        }
+      ],
+      "Default": "MotivoRecusa"
+    },
+    "MotivoRecusa": {
+      "Type": "Pass",
+      "Parameters": {
+        "compra_id.$": "$.compra_id",
+        "erro": {
+          "Error": "PAGAMENTO_RECUSADO"
+        }
+      },
+      "Next": "Compensar"
+    },
+    "ConfirmarVenda": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ConfirmarVendaFnArn}",
+        "Payload": {
+          "compra_id.$": "$.compra_id"
+        }
+      },
+      "ResultPath": "$.confirmacao",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.erro",
+          "Next": "Compensar"
+        }
+      ],
+      "Next": "CompraConcluida"
+    },
+    "Compensar": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${LiberarReservaFnArn}",
+        "Payload": {
+          "compra_id.$": "$.compra_id",
+          "motivo.$": "$.erro.Error"
+        }
+      },
+      "ResultPath": "$.compensacao",
+      "Next": "CompraCancelada"
+    },
+    "CompraConcluida": {
+      "Type": "Succeed"
+    },
+    "CompraCancelada": {
+      "Type": "Succeed"
+    }
+  }
+}

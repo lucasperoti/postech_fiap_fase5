@@ -1,0 +1,480 @@
+openapi: 3.0.3
+info:
+  title: Plataforma de Revenda de Veículos — Fase 5 (Serverless)
+  description: |
+    API serverless para revenda de veículos: cadastro de veículos e compradores,
+    listagens ordenadas por preço e processo de compra completo com SAGA
+    orquestrada (reserva → código de pagamento → webhook → baixa no estoque).
+
+    Autenticação: rotas protegidas usam JWT emitido pelo Cognito
+    (header `Authorization: Bearer <token>`). O grupo `admin` é exigido nas
+    rotas de veículos. O webhook do gateway de pagamento usa segredo próprio
+    (header `x-webhook-secret`).
+
+    No ambiente local (LocalStack), onde não há Cognito, as identidades são
+    emuladas pelos headers `x-cliente-id` e `x-admin: true`.
+  version: 1.0.0
+  contact:
+    name: Lucas Peroti
+servers:
+  - url: http://localhost:4566/restapis/{apiId}/prod/_user_request_
+    description: LocalStack (local)
+    variables:
+      apiId:
+        default: r2kfitj2cc
+        description: Id da API REST no LocalStack (scripts/deploy-local.sh imprime)
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/prod
+    description: AWS (após sam deploy)
+    variables:
+      apiId:
+        default: xxxxxxxxxx
+      region:
+        default: us-east-1
+
+tags:
+  - name: clientes
+    description: Cadastro de compradores e LGPD
+  - name: veiculos
+    description: Estoque e listagens
+  - name: compras
+    description: Processo de compra com SAGA orquestrada
+  - name: pagamentos
+    description: Webhook do gateway de pagamento
+
+paths:
+  /clientes:
+    post:
+      tags: [clientes]
+      summary: Cadastra um comprador
+      description: |
+        Rota pública. Valida o CPF, cria o usuário no Cognito (quando a
+        autenticação está habilitada) e armazena CPF/endereço cifrados com KMS.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClienteInput"
+            example:
+              nome: Ana Souza
+              email: ana@email.com
+              cpf: "529.982.247-25"
+              telefone: "(11) 99999-0000"
+              endereco:
+                rua: Av. Paulista, 1000
+                cidade: São Paulo
+                uf: SP
+      responses:
+        "201":
+          description: Comprador cadastrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cliente"
+              example:
+                id: 9f1c2a76-5b3d-4c8e-9a2f-1e5d7b9c3a44
+                nome: Ana Souza
+                email: ana@email.com
+                mascara_cpf: "***.***.***-25"
+                criado_em: "2026-09-15T12:00:00Z"
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+
+  /clientes/me:
+    delete:
+      tags: [clientes]
+      summary: Remove os dados pessoais do comprador autenticado (LGPD)
+      description: |
+        Remove CPF, endereço, telefone e email do registro (soft-delete com
+        status `EXCLUIDO`). Nome e histórico de compras são retidos como
+        registro operacional.
+      security:
+        - cognito: []
+      responses:
+        "200":
+          description: Dados removidos
+          content:
+            application/json:
+              example:
+                mensagem: Dados pessoais removidos (LGPD)
+        "401":
+          $ref: "#/components/responses/NaoAutenticado"
+        "403":
+          $ref: "#/components/responses/ClienteInativo"
+
+  /veiculos:
+    get:
+      tags: [veiculos]
+      summary: Lista veículos ordenados por preço (mais barato → mais caro)
+      description: Rota pública. A ordenação sai pronta do GSI do DynamoDB.
+      security: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [DISPONIVEL, VENDIDO]
+            default: DISPONIVEL
+      responses:
+        "200":
+          description: Listagem ordenada por preço
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  veiculos:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Veiculo"
+              example:
+                veiculos:
+                  - id: 7a3f…
+                    marca: Fiat
+                    modelo: Uno
+                    ano: 2020
+                    cor: azul
+                    preco: 34000.0
+                    status: DISPONIVEL
+                    criado_em: "2026-09-15T12:00:00Z"
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+    post:
+      tags: [veiculos]
+      summary: Cadastra um veículo para venda
+      description: Requer JWT do grupo `admin`.
+      security:
+        - cognito: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VeiculoInput"
+            example:
+              marca: Honda
+              modelo: Civic
+              ano: 2022
+              cor: prata
+              preco: 145000.0
+      responses:
+        "201":
+          description: Veículo cadastrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Veiculo"
+        "403":
+          $ref: "#/components/responses/AcessoNegado"
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+
+  /veiculos/{id}:
+    put:
+      tags: [veiculos]
+      summary: Edita os dados de um veículo
+      description: Requer JWT do grupo `admin`. Campos ausentes não são alterados.
+      security:
+        - cognito: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VeiculoInput"
+            example:
+              cor: azul
+              preco: 34000.0
+      responses:
+        "200":
+          description: Veículo atualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Veiculo"
+        "403":
+          $ref: "#/components/responses/AcessoNegado"
+        "404":
+          $ref: "#/components/responses/NaoEncontrado"
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+
+  /compras:
+    post:
+      tags: [compras]
+      summary: Inicia a compra de um veículo (reserva atômica)
+      description: |
+        Requer JWT de comprador cadastrado. Executa a reserva com escrita
+        condicional (`DISPONIVEL → RESERVADO`): em corrida, quem perde recebe
+        409. Em seguida gera o código de pagamento e inicia a SAGA
+        (`PurchaseSaga`), que aguarda o webhook por até 30 minutos.
+      security:
+        - cognito: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [veiculo_id]
+              properties:
+                veiculo_id:
+                  type: string
+                  format: uuid
+            example:
+              veiculo_id: 7a3f8c2e-1b9d-4e5a-9c6f-2d4a6b8e0c1f
+      responses:
+        "201":
+          description: Reserva criada; pagamento pendente
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  compra_id: { type: string, format: uuid }
+                  veiculo_id: { type: string, format: uuid }
+                  estado: { type: string, example: AGUARDANDO_PAGAMENTO }
+                  codigo_pagamento: { type: string, example: PAG-A1B2C3D4E5 }
+              example:
+                compra_id: 3c9e1f74-8a2b-4d6c-9e0f-1b3d5a7c9e2f
+                veiculo_id: 7a3f8c2e-1b9d-4e5a-9c6f-2d4a6b8e0c1f
+                estado: AGUARDANDO_PAGAMENTO
+                codigo_pagamento: PAG-A1B2C3D4E5
+        "401":
+          $ref: "#/components/responses/NaoAutenticado"
+        "403":
+          $ref: "#/components/responses/ClienteInativo"
+        "409":
+          description: Veículo já reservado ou vendido por outro cliente
+          content:
+            application/json:
+              example:
+                erro: VEICULO_INDISPONIVEL
+                mensagem: Veículo já reservado ou vendido
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+
+  /compras/{id}/retirada:
+    post:
+      tags: [compras]
+      summary: Conclui a venda com a retirada do veículo
+      description: |
+        Só o dono da compra pode retirar, e somente quando o estado é `PAGO`
+        (pagamento confirmado pela SAGA). Atualiza o estado para `CONCLUIDA`.
+      security:
+        - cognito: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Venda concluída
+          content:
+            application/json:
+              example:
+                compra_id: 3c9e1f74-8a2b-4d6c-9e0f-1b3d5a7c9e2f
+                estado: CONCLUIDA
+        "403":
+          $ref: "#/components/responses/AcessoNegado"
+        "404":
+          $ref: "#/components/responses/NaoEncontrado"
+        "409":
+          description: Compra ainda não está PAGO
+          content:
+            application/json:
+              example:
+                erro: ESTADO_INVALIDO
+                mensagem: A compra precisa estar PAGO para retirada
+
+  /pagamentos/webhook:
+    post:
+      tags: [pagamentos]
+      summary: Webhook do gateway de pagamento
+      description: |
+        Chamado pelo gateway de pagamento (não por usuário). Exige o segredo
+        no header `x-webhook-secret` (armazenado no AWS Secrets Manager).
+        Retoma a `PurchaseSaga` com `SendTaskSuccess` (APROVADO) ou
+        `SendTaskFailure` (RECUSADO) — recusa e timeout disparam a
+        compensação que libera o veículo.
+      security:
+        - webhookSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [compra_id, resultado]
+              properties:
+                compra_id:
+                  type: string
+                  format: uuid
+                resultado:
+                  type: string
+                  enum: [APROVADO, RECUSADO]
+            example:
+              compra_id: 3c9e1f74-8a2b-4d6c-9e0f-1b3d5a7c9e2f
+              resultado: APROVADO
+      responses:
+        "200":
+          description: Webhook processado; SAGA retomada
+          content:
+            application/json:
+              example:
+                mensagem: Pagamento processado
+        "401":
+          description: Segredo ausente ou inválido
+          content:
+            application/json:
+              example:
+                erro: SEGREDO_INVALIDO
+                mensagem: Segredo do webhook inválido ou ausente
+        "404":
+          $ref: "#/components/responses/NaoEncontrado"
+        "422":
+          $ref: "#/components/responses/ErroValidacao"
+
+components:
+  securitySchemes:
+    cognito:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT emitido pelo Cognito User Pool (grupo `admin` nas rotas de veículos)
+    webhookSecret:
+      type: apiKey
+      in: header
+      name: x-webhook-secret
+
+  schemas:
+    ClienteInput:
+      type: object
+      required: [nome, email, cpf]
+      properties:
+        nome:
+          type: string
+          minLength: 1
+          example: Ana Souza
+        email:
+          type: string
+          format: email
+          example: ana@email.com
+        cpf:
+          type: string
+          description: CPF com ou sem máscara; validado e armazenado cifrado (KMS)
+          example: "529.982.247-25"
+        telefone:
+          type: string
+          example: "(11) 99999-0000"
+        endereco:
+          type: object
+          description: Armazenado cifrado com KMS
+          properties:
+            rua: { type: string }
+            cidade: { type: string }
+            uf: { type: string, example: SP }
+        senha:
+          type: string
+          minLength: 8
+          description: Obrigatória quando a autenticação Cognito está habilitada
+          example: Senha@123
+    Cliente:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        nome: { type: string }
+        email: { type: string, format: email }
+        mascara_cpf: { type: string, example: "***.***.***-25" }
+        criado_em: { type: string, format: date-time }
+    VeiculoInput:
+      type: object
+      required: [marca, modelo, ano, cor, preco]
+      properties:
+        marca: { type: string, example: Honda }
+        modelo: { type: string, example: Civic }
+        ano:
+          type: integer
+          minimum: 1900
+          example: 2022
+        cor: { type: string, example: prata }
+        preco:
+          type: number
+          exclusiveMinimum: 0
+          example: 145000.0
+    Veiculo:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        marca: { type: string }
+        modelo: { type: string }
+        ano: { type: integer }
+        cor: { type: string }
+        preco: { type: number, example: 145000.0 }
+        status:
+          type: string
+          enum: [DISPONIVEL, RESERVADO, VENDIDO]
+        criado_em: { type: string, format: date-time }
+    Erro:
+      type: object
+      properties:
+        erro: { type: string, example: VALIDACAO }
+        mensagem: { type: string }
+
+  responses:
+    ErroValidacao:
+      description: Dados inválidos ou ausentes
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+          example:
+            erro: VALIDACAO
+            mensagem: "Campos obrigatórios ausentes: preco"
+    NaoAutenticado:
+      description: Token ausente, inválido ou identidade não encontrada
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+          example:
+            erro: NAO_AUTENTICADO
+            mensagem: Autenticação necessária
+    ClienteInativo:
+      description: Cliente não encontrado ou inativo
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+          example:
+            erro: CLIENTE_INATIVO
+            mensagem: Cliente não encontrado ou inativo
+    AcessoNegado:
+      description: Sem permissão (não é admin ou não é o dono do recurso)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+          example:
+            erro: ACESSO_NEGADO
+            mensagem: Apenas administradores podem executar esta ação
+    NaoEncontrado:
+      description: Recurso não encontrado
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+          example:
+            erro: NAO_ENCONTRADO
+            mensagem: Veículo não encontrado

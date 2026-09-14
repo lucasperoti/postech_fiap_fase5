@@ -1,0 +1,13 @@
+services:
+  localstack:
+    image: localstack/localstack:3.8.1
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=apigateway,lambda,dynamodb,kms,secretsmanager,cognito-idp,events,iam,s3,sts,cloudformation,logs,stepfunctions
+      - DEBUG=0
+      - LAMBDA_KEEPALIVE_MS=10000
+      - LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT=120
+    volumes:
+      - ./volume:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
